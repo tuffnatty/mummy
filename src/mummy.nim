@@ -393,6 +393,37 @@ proc write*(
 ) {.raises: [IOError], gcsafe.} =
   request.write(-1, body = body, moreBody = moreBody)
 
+proc respondFile*(
+  request: Request,
+  statusCode: int,
+  headers: sink HttpHeaders,
+  file: File,
+  chunkSize: Positive = 64 * 1024,
+) {.raises: [IOError], gcsafe.} =
+  ## Responds with data from an open file handle
+
+  var size: int64
+  try:
+    size = file.getFileSize
+    file.setFilePos 0
+    headers["Content-Length"] = $size;
+  except IOError:
+    discard
+
+  request.write(statusCode, headers)
+
+  while true:
+    var data = newString(chunkSize)
+    try:
+      data.setLen file.readChars(data.toOpenArray(0, data.high))
+    except EOFError:
+      break
+    if data.len == 0:
+      break
+    request.write(data)
+
+  request.write(moreBody = false)
+
 proc send*(
   websocket: WebSocket,
   data: sink string,
