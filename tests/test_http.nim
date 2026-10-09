@@ -11,6 +11,16 @@ proc handler(request: Request) =
       request.respond(200, headers, "Hello, World!")
     else:
       request.respond(405)
+  of "/chunked":
+    if request.httpMethod == "GET":
+      var headers: mummy.HttpHeaders
+      headers["Content-Type"] = "text/plain"
+      request.write(200, headers)
+      for i in 0 ..< 100:
+        request.write "abcdefghijklmnopqrstuvwxyz"
+      request.write(moreBody = false)
+    else:
+      request.respond(405)
   of "/compressed":
     if request.httpMethod == "GET":
       var headers: mummy.HttpHeaders
@@ -62,6 +72,12 @@ proc requesterProc() =
   block:
     let client = newHttpClient()
     doAssert client.get("http://localhost:8081/raise").status == "500"
+
+  block:
+    let client = newHttpClient()
+    let response = client.request("http://localhost:8081/chunked")
+    doAssert response.headers["Transfer-Encoding"] == "chunked"
+    doAssert response.body.len == 2600
 
   echo "Done, shut down the server"
   server.close()
