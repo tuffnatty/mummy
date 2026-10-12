@@ -11,7 +11,7 @@ import mummy/common, mummy/internal, std/atomics, std/base64,
     std/tables, std/times, webby/httpheaders, webby/queryparams, webby/urls,
     zippy, std/options
 
-from std/strutils import find, cmpIgnoreCase, toLowerAscii
+from std/strutils import find, cmpIgnoreCase, toHex, toLowerAscii
 
 when defined(linux):
   when defined(nimdoc):
@@ -57,6 +57,8 @@ type
     clientSocket: SocketHandle
     clientId: uint64
     responded: bool
+    responseIsChunked: bool
+
 
   Request* = ptr RequestObj
 
@@ -87,7 +89,7 @@ type
     handler: RequestHandler
     websocketHandler: WebSocketHandler
     logHandler: LogHandler
-    maxHeadersLen, maxBodyLen, maxMessageLen: int
+    maxHeadersLen, maxBodyLen, maxMessageLen, maxSendBuffers: int
     tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
@@ -97,6 +99,8 @@ type
     selector: Selector[DataEntry]
     responseQueued, sendQueued, shutdown: SelectEvent
     clientSockets: HashSet[SocketHandle]
+    clientSocketsLock: Lock
+    stalledClientSockets: HashSet[SocketHandle]
     taskQueueLock: Lock
     taskQueueCond: Cond
     taskQueue: Deque[WorkerTask]
@@ -158,6 +162,7 @@ type
     clientSocket: SocketHandle
     clientId: uint64
     closeConnection, isWebSocketUpgrade, isCloseFrame: bool
+    isStreaming: bool
     buffer1, buffer2: string
     bytesSent: int
 
@@ -259,6 +264,166 @@ proc setNoDelay(
       "Error setting TCP_NODELAY: ", e.msg
     )
 
+proc enqueueSend(
+  server: Server,
+  buffer: sink OutgoingBuffer,
+) {.raises: [], gcsafe.} =
+  var queueWasEmpty: bool
+  withLock server.sendQueueLock:
+    queueWasEmpty = server.sendQueue.len == 0
+    server.sendQueue.addLast(move buffer)
+
+  if queueWasEmpty:
+    server.trigger(server.sendQueued)
+
+proc enqueueSendBlocking(
+  server: Server,
+  buffer: sink OutgoingBuffer,
+) {.raises: [IOError], gcsafe.} =
+  var queueWasEmpty: bool
+  var socketDead, socketReady: bool
+  while true:
+    withLock server.sendQueueLock:
+      queueWasEmpty = server.sendQueue.len == 0
+      withLock server.clientSocketsLock:
+        socketReady = buffer.clientSocket notin server.stalledClientSockets
+        socketDead = buffer.clientSocket notin server.clientSockets
+      if socketReady and not socketDead:
+        server.sendQueue.addLast(move buffer)
+        break
+    # The send queue has grown too large. Block if the socket is still alive
+    if socketDead:
+      raise newException(IOError,
+                         "Error writing to a disconnected client socket")
+    sleep 1
+
+  if queueWasEmpty:
+    server.trigger(server.sendQueued)
+
+proc setResponsePayload(
+  buffer: OutgoingBuffer,
+  statusCode: int,
+  headers: sink HttpHeaders,
+  body: sink string,
+  chunked = false
+) =
+  buffer.buffer1 = encodeHeaders(statusCode, headers)
+  if chunked and body.len > 0:
+    buffer.buffer1 &= body.len.toHex & "\r\n"
+    body &= "\r\n"
+  if buffer.buffer1.len + body.len < 32 * 1024:
+    # There seems to be a harsh penalty on multiple send() calls on Linux
+    # so just use 1 buffer if the body is small enough
+    buffer.buffer1 &= body
+  else:
+    buffer.buffer2 = move body
+
+proc write*(
+  request: Request,
+  statusCode: int = -1,
+  headers: sink HttpHeaders = emptyHttpHeaders(),
+  body: sink string = "",
+  moreBody: bool = true,
+) {.raises: [IOError], gcsafe.} =
+  ## Enqueues a streaming response chunk.
+  ##
+  ## On the first call, provide a statusCode and headers.
+  ## On the last call, if not a Connection: keep-alive, pass moreBody = false
+  ## to close the connection.
+  ## May block when the client socket's outgoing buffers queue exceeds
+  ## maxSendBuffers.
+
+  if statusCode != -1 and request.responded:
+    request.server.log(
+      InfoLevel,
+      "Writing headers to a request that has already received a non-1xx response"
+    )
+
+  if statusCode == -1 and body.len == 0 and moreBody:
+    # Handle empty chunks early
+    return
+
+  var encodedFrame = OutgoingBuffer(clientSocket: request.clientSocket,
+                                    clientId: request.clientId,
+                                    closeConnection: not moreBody,
+                                    isStreaming: true)
+
+  # FIXME: Compression would require buffering
+
+  if statusCode != -1:
+    if statusCode < 100 or statusCode >= 200:
+      # Mark if this request has received a non-informational (1xx) response
+      request.responded = true
+
+    if not headers.headerContainsToken("Connection", "keep-alive"):
+      headers["Connection"] = "close"
+
+    # Chunked transfer encoding is HTTP 1.1-only, required if no Content-Length
+    # is specified, and disallowed for any 1xx or 204 responses, and for 2xx
+    # CONNECT responses. See RFC 7230 3.3.1.
+    request.responseIsChunked =
+      request.httpVersion == Http11 and "Content-Length" notin headers and
+      statusCode != 204 and (statusCode < 100 or statusCode >= 200) and
+      not (statusCode >= 200 and statusCode < 300 and
+           request.httpMethod == "CONNECT")
+    if request.responseIsChunked:
+      headers["Transfer-Encoding"] = "chunked"
+
+    encodedFrame.setResponsePayload(statusCode, headers, body,
+                                    request.responseIsChunked)
+
+  elif request.responseIsChunked:
+    if body.len > 0:
+      encodedFrame.buffer1 = body.len.toHex & "\r\n"
+      body &= "\r\n"
+      encodedFrame.buffer2 = move body
+
+  else:
+    encodedFrame.buffer1 = move body
+
+  if request.responseIsChunked and not moreBody:
+    encodedFrame.buffer2 &= "0\r\n\r\n"
+
+  request.server.enqueueSendBlocking(encodedFrame)
+
+proc write*(
+  request: Request,
+  body: sink string = "",
+  moreBody: bool = true,
+) {.raises: [IOError], gcsafe.} =
+  request.write(-1, body = body, moreBody = moreBody)
+
+proc respondFile*(
+  request: Request,
+  statusCode: int,
+  headers: sink HttpHeaders,
+  file: File,
+  chunkSize: Positive = 64 * 1024,
+) {.raises: [IOError], gcsafe.} =
+  ## Responds with data from an open file handle
+
+  var size: int64
+  try:
+    size = file.getFileSize
+    file.setFilePos 0
+    headers["Content-Length"] = $size;
+  except IOError:
+    discard
+
+  request.write(statusCode, headers)
+
+  while true:
+    var data = newString(chunkSize)
+    try:
+      data.setLen file.readChars(data.toOpenArray(0, data.high))
+    except EOFError:
+      break
+    if data.len == 0:
+      break
+    request.write(data)
+
+  request.write(moreBody = false)
+
 proc send*(
   websocket: WebSocket,
   data: sink string,
@@ -282,13 +447,7 @@ proc send*(
 
   encodedFrame.buffer2 = move data
 
-  var queueWasEmpty: bool
-  withLock websocket.server.sendQueueLock:
-    queueWasEmpty = websocket.server.sendQueue.len == 0
-    websocket.server.sendQueue.addLast(move encodedFrame)
-
-  if queueWasEmpty:
-    websocket.server.trigger(websocket.server.sendQueued)
+  websocket.server.enqueueSend(encodedFrame)
 
 proc close*(websocket: WebSocket) {.raises: [], gcsafe.} =
   ## Begins the WebSocket closing handshake.
@@ -302,13 +461,7 @@ proc close*(websocket: WebSocket) {.raises: [], gcsafe.} =
   encodedFrame.buffer1 = encodeFrameHeader(0x8, 0)
   encodedFrame.isCloseFrame = true
 
-  var queueWasEmpty: bool
-  withLock websocket.server.sendQueueLock:
-    queueWasEmpty = websocket.server.sendQueue.len == 0
-    websocket.server.sendQueue.addLast(move encodedFrame)
-
-  if queueWasEmpty:
-    websocket.server.trigger(websocket.server.sendQueued)
+  websocket.server.enqueueSend(encodedFrame)
 
 proc respond*(
   request: Request,
@@ -385,13 +538,7 @@ proc respond*(
     if shouldAddContentLengthHeader or body.len > 0:
       headers["Content-Length"] = $body.len
 
-  encodedResponse.buffer1 = encodeHeaders(statusCode, headers)
-  if encodedResponse.buffer1.len + body.len < 32 * 1024:
-    # There seems to be a harsh penalty on multiple send() calls on Linux
-    # so just use 1 buffer if the body is small enough
-    encodedResponse.buffer1 &= body
-  else:
-    encodedResponse.buffer2 = move body
+  encodedResponse.setResponsePayload(statusCode, headers, body)
   encodedResponse.isWebSocketUpgrade = headers.headerContainsToken(
     "Upgrade",
     "websocket"
@@ -1118,11 +1265,15 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
       discard # Ignore
   if server.socket.int != 0:
     server.socket.close()
-  for clientSocket in server.clientSockets:
-    clientSocket.close()
+  withLock server.clientSocketsLock:
+    for clientSocket in server.clientSockets:
+      clientSocket.close()
+    server.clientSockets.clear()
+    server.stalledClientSockets.clear()
   broadcast(server.taskQueueCond)
   if joinThreads:
     joinThreads(server.workerThreads)
+    deinitLock(server.clientSocketsLock)
     deinitLock(server.taskQueueLock)
     deinitCond(server.taskQueueCond)
     deinitLock(server.responseQueueLock)
@@ -1152,12 +1303,15 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     readyKeys: array[maxEventsPerSelectLoop, ReadyKey]
     receivedFrom, sentTo: seq[SocketHandle]
     needClosing: HashSet[SocketHandle]
+    ghostClientSockets: HashSet[SocketHandle]
     encodedResponses: seq[OutgoingBuffer]
     encodedFrames: seq[OutgoingBuffer]
+    stalledSendFrames: seq[OutgoingBuffer]
   while true:
     receivedFrom.setLen(0)
     sentTo.setLen(0)
     needClosing.clear()
+    ghostClientSockets.clear()
     encodedResponses.setLen(0)
     encodedFrames.setLen(0)
 
@@ -1231,6 +1385,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
       # If we have any sends queued move them to the outgoing buffer queue of
       # the appropriate socket and update the socket selector to include Write
 
+      # Process accumulated stalled frames first
+      swap(encodedFrames, stalledSendFrames)
+
       withLock server.sendQueueLock:
         while server.sendQueue.len > 0:
           encodedFrames.add(server.sendQueue.popFirst())
@@ -1240,8 +1397,26 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           let clientDataEntry =
             server.selector.getData(encodedFrame.clientSocket)
           if encodedFrame.clientId == clientDataEntry.clientId:
-            # Have we sent the upgrade response yet?
-            if clientDataEntry.upgradedToWebSocket:
+            if encodedFrame.isStreaming:
+              # If the target client socket buffer queue is full, store the
+              # frame to stalledSendFrames. Maintain a set of stalled sockets
+              # that serves two purposes: 1) allow retriggering the send event
+              # in another iteration that has freed some slots. 2) signal the
+              # worker to block.
+              withLock server.clientSocketsLock:
+                if clientDataEntry.outgoingBuffers.len >= server.maxSendBuffers:
+                  server.stalledClientSockets.incl encodedFrame.clientSocket
+                  stalledSendFrames.add(encodedFrame)
+                else:
+                  server.stalledClientSockets.excl encodedFrame.clientSocket
+                  if encodedFrame.closeConnection:
+                    clientDataEntry.requestCounter =
+                      max(clientDataEntry.requestCounter - 1, 0)
+                  clientDataEntry.outgoingBuffers.addLast(encodedFrame)
+                  server.selector.updateHandle2(encodedFrame.clientSocket,
+                                                {Read, Write})
+            # If WebSocket, have we sent the upgrade response yet?
+            elif clientDataEntry.upgradedToWebSocket:
               if clientDataEntry.closeFrameQueuedAt > 0:
                 server.log(DebugLevel, "Dropped message after WebSocket close")
               else:
@@ -1306,7 +1481,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           if server.tcpNoDelay:
             server.setNoDelay(clientSocket)
 
-          server.clientSockets.incl(clientSocket)
+          withLock server.clientSocketsLock:
+            server.clientSockets.incl(clientSocket)
 
           let dataEntry = DataEntry(kind: ClientSocketEntry)
           dataEntry.clientId = server.rand.next()
@@ -1350,11 +1526,13 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               else:
                 let buffer2Pos =
                   outgoingBuffer.bytesSent - outgoingBuffer.buffer1.len
-                readyKey.fd.SocketHandle.send(
-                  outgoingBuffer.buffer2[buffer2Pos].addr,
-                  (outgoingBuffer.buffer2.len - buffer2Pos).cint,
-                  when defined(MSG_NOSIGNAL): MSG_NOSIGNAL else: 0
-                )
+                if buffer2Pos < outgoingBuffer.buffer2.len:
+                  readyKey.fd.SocketHandle.send(
+                    outgoingBuffer.buffer2[buffer2Pos].addr,
+                    (outgoingBuffer.buffer2.len - buffer2Pos).cint,
+                    when defined(MSG_NOSIGNAL): MSG_NOSIGNAL else: 0
+                  )
+                else: 0
           if bytesSent > 0:
             outgoingBuffer.bytesSent += bytesSent
             sentTo.add(readyKey.fd.SocketHandle)
@@ -1382,14 +1560,16 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
 
     for clientSocket in needClosing:
       let dataEntry = server.selector.getData(clientSocket)
-      try:
-        server.selector.unregister(clientSocket)
-      except Exception as e:
-        # Leaks DataEntry for this socket
-        server.log(DebugLevel, "Error unregistering client socket")
-      finally:
-        clientSocket.close()
-        server.clientSockets.excl(clientSocket)
+      withLock server.clientSocketsLock:
+        try:
+          server.selector.unregister(clientSocket)
+        except Exception as e:
+          # Leaks DataEntry for this socket
+          server.log(DebugLevel, "Error unregistering client socket")
+        finally:
+          clientSocket.close()
+          server.clientSockets.excl(clientSocket)
+          server.stalledClientSockets.excl(clientSocket)
       if dataEntry.upgradedToWebSocket:
         let websocket = WebSocket(
           server: server,
@@ -1401,6 +1581,25 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           websocket.postWebSocketUpdate(error)
         var close = WebSocketUpdate(event: CloseEvent)
         websocket.postWebSocketUpdate(close)
+
+    # Retrigger send queue event if we've freed some client socket queue slots
+    # or to clean the ghost frames from the send queue
+    var retriggerSend = false
+    withLock server.clientSocketsLock:
+      for clientSocket in server.stalledClientSockets:
+        if clientSocket in server.selector:
+          let dataEntry = server.selector.getData(clientSocket)
+          if dataEntry.outgoingBuffers.len < server.maxSendBuffers:
+            retriggerSend = true
+        else:
+          ghostClientSockets.incl clientSocket
+          retriggerSend = true
+      for clientSocket in ghostClientSockets:
+        server.log(DebugLevel,
+                   "A closed client socket in the stalled client socket list")
+        server.stalledClientSockets.excl clientSocket
+    if retriggerSend:
+      server.trigger(server.sendQueued)
 
 proc close*(server: Server) {.raises: [], gcsafe.} =
   ## Cleanly stops and deallocates the server.
@@ -1477,7 +1676,8 @@ proc newServer*(
   maxHeadersLen = 8 * 1024, # 8 KB
   maxBodyLen = 1024 * 1024, # 1 MB
   maxMessageLen = 64 * 1024, # 64 KB
-  tcpNoDelay = true
+  tcpNoDelay = true,
+  maxSendBuffers: Positive = 64,
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1501,6 +1701,7 @@ proc newServer*(
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
   result.tcpNoDelay = tcpNoDelay
+  result.maxSendBuffers = maxSendBuffers
   result.rand = initRand()
 
   result.workerThreads.setLen(workerThreads)
@@ -1525,6 +1726,7 @@ proc newServer*(
     shutdownData.event = result.shutdown
     result.selector.registerEvent(result.shutdown, shutdownData)
 
+    initLock(result.clientSocketsLock)
     initLock(result.taskQueueLock)
     initCond(result.taskQueueCond)
     initLock(result.responseQueueLock)
